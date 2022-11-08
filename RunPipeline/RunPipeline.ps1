@@ -211,7 +211,7 @@ try {
     }
     $authContext = $null
     $environmentName = ""
-    $CreateRuntimePackages = $false
+    $CreateRuntimePackages = $true
 
     if ($repo.versioningStrategy -eq -1) {
         $artifactVersion = [Version]$repo.artifact.Split('/')[4]
