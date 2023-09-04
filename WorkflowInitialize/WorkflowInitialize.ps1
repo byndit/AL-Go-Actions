@@ -3,12 +3,8 @@ Param(
     [string] $eventId
 )
 
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version 2.0
 $telemetryScope = $null
-$BcContainerHelperPath = ""
 
-# IMPORTANT: No code that can fail should be outside the try/catch
 try {
     . (Join-Path -Path $PSScriptRoot -ChildPath "..\AL-Go-Helper.ps1" -Resolve)
     . (Join-Path -Path $PSScriptRoot -ChildPath "..\AL-Go-TestRepoHelper.ps1" -Resolve)
@@ -29,9 +25,9 @@ try {
 
     Write-Big -str "a$verstr"
 
-    Test-ALGoRepository -baseFolder $ENV:GITHUB_WORKSPACE
+    Test-ALGoRepository
 
-    $BcContainerHelperPath = DownloadAndImportBcContainerHelper -baseFolder $ENV:GITHUB_WORKSPACE
+    DownloadAndImportBcContainerHelper
 
     import-module (Join-Path -path $PSScriptRoot -ChildPath "..\TelemetryHelper.psm1" -Resolve)
     $telemetryScope = CreateScope -eventId $eventId
@@ -67,16 +63,15 @@ try {
         $correlationId = [guid]::Empty.ToString()
     }
 
-    Add-Content -Path $env:GITHUB_OUTPUT -Value "telemetryScopeJson=$scopeJson"
+    Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "telemetryScopeJson=$scopeJson"
     Write-Host "telemetryScopeJson=$scopeJson"
 
-    Add-Content -Path $env:GITHUB_OUTPUT -Value "correlationId=$correlationId"
+    Add-Content -Encoding UTF8 -Path $env:GITHUB_OUTPUT -Value "correlationId=$correlationId"
     Write-Host "correlationId=$correlationId"
 }
 catch {
-    OutputError -message "WorkflowInitialize action failed.$([environment]::Newline)Error: $($_.Exception.Message)$([environment]::Newline)Stacktrace: $($_.scriptStackTrace)"
-    TrackException -telemetryScope $telemetryScope -errorRecord $_
-}
-finally {
-    CleanupAfterBcContainerHelper -bcContainerHelperPath $bcContainerHelperPath
+    if (Get-Module BcContainerHelper) {
+        TrackException -telemetryScope $telemetryScope -errorRecord $_
+    }
+    throw
 }

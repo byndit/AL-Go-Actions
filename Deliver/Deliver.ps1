@@ -20,10 +20,7 @@ Param(
     [bool] $goLive
 )
 
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version 2.0
 $telemetryScope = $null
-$bcContainerHelperPath = $null
 
 function EnsureAzStorageModule() {
     if (get-command New-AzStorageContext -ErrorAction SilentlyContinue) {
@@ -47,12 +44,9 @@ function EnsureAzStorageModule() {
     }
 }
 
-# IMPORTANT: No code that can fail should be outside the try/catch
-
 try {
-    $baseFolder = $ENV:GITHUB_WORKSPACE
     . (Join-Path -Path $PSScriptRoot -ChildPath "../AL-Go-Helper.ps1" -Resolve)
-    $BcContainerHelperPath = DownloadAndImportBcContainerHelper -baseFolder $baseFolder
+    DownloadAndImportBcContainerHelper
 
     import-module (Join-Path -path $PSScriptRoot -ChildPath "../TelemetryHelper.psm1" -Resolve)
     $telemetryScope = CreateScope -eventId 'DO0081' -parentTelemetryScopeJson $parentTelemetryScopeJson
@@ -66,6 +60,7 @@ try {
 
     $artifacts = $artifacts.Replace('/',([System.IO.Path]::DirectorySeparatorChar)).Replace('\',([System.IO.Path]::DirectorySeparatorChar))
 
+    $baseFolder = $ENV:GITHUB_WORKSPACE
     $settings = ReadSettings -baseFolder $baseFolder
     if ($settings.projects) {
         $projectList = $settings.projects | Where-Object { $_ -like $projects }
@@ -89,13 +84,7 @@ try {
     Write-Host "Projects:"
     $projectList | Out-Host
 
-    if ("$env:deliveryContext" -eq "") {
-        throw "$($deliveryTarget)Context is not defined, cannot deliver to $deliveryTarget"
-    }
-    $key = "$($deliveryTarget)Context"
-    Write-Host "Using $key"
-    Set-Variable -Name $key -Value $env:deliveryContext
-
+    $secrets = $env:Secrets | ConvertFrom-Json
     $projectList | ForEach-Object {
         $thisProject = $_
         # $project should be the project part of the artifact name generated from the build
@@ -103,7 +92,7 @@ try {
             $project = $thisProject.Replace('\','_').Replace('/','_')
         }
         else {
-            $project = $env:repoName
+            $project = $settings.repoName
         }
         # projectName is the project name stripped for special characters
         $projectName = $project -replace "[^a-z0-9]", "-"
@@ -193,7 +182,7 @@ try {
                 "Project" = $thisProject
                 "ProjectName" = $projectName
                 "type" = $type
-                "Context" = $env:deliveryContext
+                "Context" = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets."$($deliveryTarget)Context"))
                 "RepoSettings" = $settings
                 "ProjectSettings" = $projectSettings
             }
@@ -235,7 +224,7 @@ try {
             . $customScript -parameters $parameters
         }
         elseif ($deliveryTarget -eq "GitHubPackages") {
-            $githubPackagesCredential = $githubPackagesContext | ConvertFrom-Json
+            $githubPackagesCredential = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets.githubPackagesContext)) | ConvertFrom-Json
             'Apps' | ForEach-Object {
                 $folder = @(Get-ChildItem -Path (Join-Path $artifactsFolder "$project-$refname-$($_)-*.*.*.*") | Where-Object { $_.PSIsContainer })
                 if ($folder.Count -gt 1) {
@@ -259,10 +248,10 @@ try {
         }
         elseif ($deliveryTarget -eq "NuGet") {
             try {
-                $nuGetAccount = $nuGetContext | ConvertFrom-Json | ConvertTo-HashTable
+                $nuGetAccount = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets.nuGetContext)) | ConvertFrom-Json | ConvertTo-HashTable
                 $nuGetServerUrl = $nuGetAccount.ServerUrl
                 $nuGetToken = $nuGetAccount.Token
-                Write-Host "NuGetContext OK"
+                Write-Host "NuGetContext secret OK"
             }
             catch {
                 throw "NuGetContext secret is malformed. Needs to be formatted as Json, containing serverUrl and token as a minimum."
@@ -297,14 +286,14 @@ try {
                 $parameters.dependencyAppFiles = @(Get-Item -Path (Join-Path $dependenciesFolder[0] "*.app") | ForEach-Object { $_.FullName })
             }
             if ($nuGetAccount.Keys -contains 'PackageName') {
-                $parameters.packageId = $nuGetAccount.PackageName.replace('{project}',$projectName).replace('{owner}',$ENV:GITHUB_REPOSITORY_OWNER).replace('{repo}',$env:repoName)
+                $parameters.packageId = $nuGetAccount.PackageName.replace('{project}',$projectName).replace('{owner}',$ENV:GITHUB_REPOSITORY_OWNER).replace('{repo}',$settings.repoName)
             }
             else {
                 if ($thisProject -and ($thisProject -eq '.')) {
-                    $parameters.packageId = "$($ENV:GITHUB_REPOSITORY_OWNER)-$($env:repoName)"
+                    $parameters.packageId = "$($ENV:GITHUB_REPOSITORY_OWNER)-$($settings.repoName)"
                 }
                 else {
-                    $parameters.packageId = "$($ENV:GITHUB_REPOSITORY_OWNER)-$($env:repoName)-$ProjectName"
+                    $parameters.packageId = "$($ENV:GITHUB_REPOSITORY_OWNER)-$($settings.repoName)-$ProjectName"
                 }
             }
             if ($type -eq 'CD') {
@@ -335,18 +324,29 @@ try {
         elseif ($deliveryTarget -eq "Storage") {
             EnsureAzStorageModule
             try {
-                $storageAccount = $storageContext | ConvertFrom-Json | ConvertTo-HashTable
-                Write-Host "Json OK"
-                if ($storageAccount.Keys -contains 'sastoken') {
-                    $azStorageContext = New-AzStorageContext -StorageAccountName $storageAccount.StorageAccountName -SasToken $storageAccount.sastoken
-                }
-                else {
-                    $azStorageContext = New-AzStorageContext -StorageAccountName $storageAccount.StorageAccountName -StorageAccountKey $storageAccount.StorageAccountKey
-                }
-                Write-Host "StorageContext OK"
+                $storageAccount = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets.storageContext)) | ConvertFrom-Json | ConvertTo-HashTable
+                # Check that containerName and blobName are present
+                $storageAccount.containerName | Out-Null
+                $storageAccount.blobName | Out-Null
             }
             catch {
-                throw "StorageContext secret is malformed. Needs to be formatted as Json, containing StorageAccountName, containerName, blobName and sastoken or storageAccountKey, which points to an existing container in a storage account.`nError was: $($_.Exception.Message)"
+                throw "StorageContext secret is malformed. Needs to be formatted as Json, containing StorageAccountName, containerName, blobName and sastoken or storageAccountKey.`nError was: $($_.Exception.Message)"
+            }
+            if ($storageAccount.Keys -contains 'sastoken') {
+                try {
+                    $azStorageContext = New-AzStorageContext -StorageAccountName $storageAccount.StorageAccountName -SasToken $storageAccount.sastoken
+                }
+                catch {
+                    throw "Unable to create AzStorageContext based on StorageAccountName and sastoken.`nError was: $($_.Exception.Message)"
+                }
+            }
+            else {
+                try {
+                    $azStorageContext = New-AzStorageContext -StorageAccountName $storageAccount.StorageAccountName -StorageAccountKey $storageAccount.StorageAccountKey
+                }
+                catch {
+                    throw "Unable to create AzStorageContext based on StorageAccountName and StorageAccountKey.`nError was: $($_.Exception.Message)"
+                }
             }
 
             $storageContainerName =  $storageAccount.ContainerName.ToLowerInvariant().replace('{project}',$projectName).replace('{branch}',$refname).ToLowerInvariant()
@@ -403,8 +403,11 @@ try {
             # if type is CD, we get here for all projects, but should only deliver to AppSource if AppSourceContinuousDelivery is set to true
             if ($type -eq 'Release' -or ($projectSettings.Keys -contains 'AppSourceContinuousDelivery' -and $projectSettings.AppSourceContinuousDelivery)) {
                 EnsureAzStorageModule
-                $appSourceContextHt = $appSourceContext | ConvertFrom-Json | ConvertTo-HashTable
-                $authContext = New-BcAuthContext @appSourceContextHt
+                $appSourceContext = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($secrets.appSourceContext)) | ConvertFrom-Json | ConvertTo-HashTable
+                if (!$appSourceContext) {
+                    throw "appSourceContext secret is missing"
+                }
+                $authContext = New-BcAuthContext @appSourceContext
 
                 if ($projectSettings.Keys -contains "AppSourceMainAppFolder") {
                     $AppSourceMainAppFolder = $projectSettings.AppSourceMainAppFolder
@@ -422,7 +425,7 @@ try {
                 }
                 Write-Host "AppSource MainAppFolder $AppSourceMainAppFolder"
 
-                $mainAppJson = Get-Content -Path (Join-Path $baseFolder "$thisProject/$AppSourceMainAppFolder/app.json") | ConvertFrom-Json
+                $mainAppJson = Get-Content -Path (Join-Path $baseFolder "$thisProject/$AppSourceMainAppFolder/app.json") -Encoding UTF8 | ConvertFrom-Json
                 $mainAppVersion = [Version]$mainAppJson.Version
                 $mainAppFileName = ("$($mainAppJson.Publisher)_$($mainAppJson.Name)_".Split([System.IO.Path]::GetInvalidFileNameChars()) -join '') + "*.*.*.*.app"
                 $artfolder = @(Get-ChildItem -Path (Join-Path $artifactsFolder "$project-$refname-Apps-*.*.*.*") | Where-Object { $_.PSIsContainer })
@@ -464,9 +467,8 @@ try {
     TrackTrace -telemetryScope $telemetryScope
 }
 catch {
-    OutputError -message "Deliver action failed.$([environment]::Newline)Error: $($_.Exception.Message)$([environment]::Newline)Stacktrace: $($_.scriptStackTrace)"
-    TrackException -telemetryScope $telemetryScope -errorRecord $_
-}
-finally {
-    CleanupAfterBcContainerHelper -bcContainerHelperPath $bcContainerHelperPath
+    if (Get-Module BcContainerHelper) {
+        TrackException -telemetryScope $telemetryScope -errorRecord $_
+    }
+    throw
 }

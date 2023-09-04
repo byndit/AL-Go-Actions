@@ -69,7 +69,21 @@ function InvokeWebRequest {
         if ($outfile) {
             $params += @{ "outfile" = $outfile }
         }
-        Invoke-WebRequest  @params -Uri $uri
+        try {
+            $result = Invoke-WebRequest  @params -Uri $uri
+        }
+        catch [System.Net.WebException] {
+            $response = $_.Exception.Response
+            $responseUri = $response.ResponseUri.AbsoluteUri
+            if ($response.StatusCode -eq 404 -and $responseUri -ne $uri) {
+                Write-Host "::Warning::Repository ($uri) was renamed or moved, please update your references with the new name. Trying $responseUri, as suggested by GitHub."
+                $result = Invoke-WebRequest @params -Uri $responseUri
+            }
+            else {
+                throw
+            }
+        }
+        $result
     }
     catch {
         $message = GetExtendedErrorMessage -errorRecord $_
@@ -93,7 +107,7 @@ function InvokeWebRequest {
     }
 }
 
-function Get-dependencies {
+function Get-Dependencies {
     Param(
         $probingPathsJson,
         [string] $api_url = $ENV:GITHUB_API_URL,
@@ -107,14 +121,26 @@ function Get-dependencies {
     $downloadedList = @()
     'Apps','TestApps' | ForEach-Object {
         $mask = $_
-        Write-Host "Locating all $mask artifacts from probing paths"
         $probingPathsJson | ForEach-Object {
             $dependency = $_
             $projects = $dependency.projects
+            $buildMode = $dependency.buildMode
+            
+            # change the mask to include the build mode
+            if($buildMode -ne "Default") {
+                $mask = "$buildMode$mask"
+            }
+
+            Write-Host "Locating $mask artifacts for projects: $projects"
+            
             if ($dependency.release_status -eq "thisBuild") {
                 $missingProjects = @()
                 $projects.Split(',') | ForEach-Object {
-                    $downloadName = Join-Path $saveToPath "thisbuild-$($_)-$($mask)"
+                    $project = $_
+                    $project = $project.Replace('\','_').Replace('/','_') # sanitize project name
+                    
+                    $downloadName = Join-Path $saveToPath "thisbuild-$project-$($mask)"
+                    
                     if (Test-Path $downloadName -PathType Container) {
                         $folder = Get-Item $downloadName
                         Get-ChildItem -Path $folder | ForEach-Object {
@@ -127,14 +153,14 @@ function Get-dependencies {
                             Write-Host "$($_.FullName) found from previous job"
                         }
                     }
-                    elseif ($mask -ne 'TestApps') {
+                    elseif ($mask -notlike '*TestApps') {
                         Write-Host "$_ not built, downloading from artifacts"
                         $missingProjects += @($_)
                     }
                 }
                 if ($missingProjects) {
                     $dependency.release_status = 'latestBuild'
-                    $dependency.branch = "main"
+                    $dependency.branch = $dependency.baseBranch
                     $dependency.projects = $missingProjects -join ","
                 }
             }
@@ -279,7 +305,12 @@ function invoke-gh {
             $arguments += "$_ "
         }
     }
-    cmdDo -command gh -arguments $arguments -silent:$silent -returnValue:$returnValue -inputStr $inputStr
+    try {
+        cmdDo -command gh -arguments $arguments -silent:$silent -returnValue:$returnValue -inputStr $inputStr
+    }
+    catch [System.Management.Automation.MethodInvocationException] {
+        throw "It looks like GitHub CLI is not installed. Please install GitHub CLI from https://cli.github.com/"
+    }
 }
 
 function invoke-git {
@@ -301,14 +332,34 @@ function invoke-git {
             $arguments += "$_ "
         }
     }
-    cmdDo -command git -arguments $arguments -silent:$silent -returnValue:$returnValue -inputStr $inputStr
+    try {
+        cmdDo -command git -arguments $arguments -silent:$silent -returnValue:$returnValue -inputStr $inputStr
+    }
+    catch [System.Management.Automation.MethodInvocationException] {
+        throw "It looks like Git is not installed. Please install Git from https://git-scm.com/download"
+    }
 }
 
+# Convert a semantic version object to a semantic version string
+#
+# The SemVer object has the following properties:
+#   Prefix: 'v' or ''
+#   Major: the major version number
+#   Minor: the minor version number
+#   Patch: the patch version number
+#   Addt0: the first additional segment (zzz means not specified)
+#   Addt1: the second additional segment (zzz means not specified)
+#   Addt2: the third additional segment (zzz means not specified)
+#   Addt3: the fourth additional segment (zzz means not specified)
+#   Addt4: the fifth additional segment (zzz means not specified)
+#
+# Returns the SemVer string
+#   #   [v]major.minor.patch[-addt0[.addt1[.addt2[.addt3[.addt4]]]]]
 function SemVerObjToSemVerStr {
     Param(
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
         $semVerObj
     )
-
     try {
         $str = "$($semVerObj.Prefix)$($semVerObj.Major).$($semVerObj.Minor).$($semVerObj.Patch)"
         for ($i=0; $i -lt 5; $i++) {
@@ -323,34 +374,80 @@ function SemVerObjToSemVerStr {
     }
 }
 
+# Convert a semantic version string to a semantic version object
+# SemVer strings supported are defined under https://semver.org, additionally allowing a leading 'v' (as supported by GitHub semver sorting)
+#
+# The string has the following format:
+#   if allowMajorMinorOnly is specified:
+#     [v]major.minor.[patch[-addt0[.addt1[.addt2[.addt3[.addt4]]]]]]
+#   else
+#     [v]major.minor.patch[-addt0[.addt1[.addt2[.addt3[.addt4]]]]]
+#
+# Returns the SemVer object. The SemVer object has the following properties:
+#   Prefix: 'v' or ''
+#   Major: the major version number
+#   Minor: the minor version number
+#   Patch: the patch version number
+#   Addt0: the first additional segment (zzz means not specified)
+#   Addt1: the second additional segment (zzz means not specified)
+#   Addt2: the third additional segment (zzz means not specified)
+#   Addt3: the fourth additional segment (zzz means not specified)
+#   Addt4: the fifth additional segment (zzz means not specified)
+
 function SemVerStrToSemVerObj {
     Param(
-        [string] $semVerStr
+        [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+        [string] $semVerStr,
+        [switch] $allowMajorMinorOnly
     )
 
     $obj = New-Object PSCustomObject
     try {
+        # Only allowed prefix is a 'v'.
+        # This is supported by GitHub when sorting tags
         $prefix = ''
         $verstr = $semVerStr
         if ($semVerStr -like 'v*') {
             $prefix = 'v'
             $verStr = $semVerStr.Substring(1)
         }
+        # Next part is a version number with 2 or 3 segments
+        # 2 segments are allowed only if $allowMajorMinorOnly is specified
         $version = [System.Version]"$($verStr.split('-')[0])"
         if ($version.Revision -ne -1) { throw "not semver" }
+        if ($version.Build -eq -1) {
+            if ($allowMajorMinorOnly) {
+                $version = [System.Version]"$($version.Major).$($version.Minor).0"
+                $idx = $semVerStr.IndexOf('-')
+                if ($idx -eq -1) {
+                    $semVerStr = "$semVerStr.0"
+                }
+                else {
+                    $semVerstr = $semVerstr.insert($idx, '.0')
+                }
+            }
+            else {
+                throw "not semver"
+            }
+        }
+        # Add properties to the object
         $obj | Add-Member -MemberType NoteProperty -Name "Prefix" -Value $prefix
         $obj | Add-Member -MemberType NoteProperty -Name "Major" -Value ([int]$version.Major)
         $obj | Add-Member -MemberType NoteProperty -Name "Minor" -Value ([int]$version.Minor)
         $obj | Add-Member -MemberType NoteProperty -Name "Patch" -Value ([int]$version.Build)
         0..4 | ForEach-Object {
+            # default segments to 'zzz' for sorting of SemVer Objects to work as GitHub does
             $obj | Add-Member -MemberType NoteProperty -Name "Addt$_" -Value 'zzz'
         }
         $idx = $verStr.IndexOf('-')
         if ($idx -gt 0) {
             $segments = $verStr.SubString($idx+1).Split('.')
-            if ($segments.Count -ge 5) {
+            if ($segments.Count -gt 5) {
                 throw "max. 5 segments"
             }
+            # Add all 5 segments to the object
+            # If the segment is a number, it is converted to an integer
+            # If the segment is a string, it cannot be -ge 'zzz' (would be sorted wrongly)
             0..($segments.Count-1) | ForEach-Object {
                 $result = 0
                 if ([int]::TryParse($segments[$_], [ref] $result)) {
@@ -364,6 +461,7 @@ function SemVerStrToSemVerObj {
                 }
             }
         }
+        # Check that the object can be converted back to the original string
         $newStr = SemVerObjToSemVerStr -semVerObj $obj
         if ($newStr -cne $semVerStr) {
             throw "Not equal"
@@ -397,8 +495,7 @@ function GetReleases {
             $sortedReleases
         }
         catch {
-            Write-Host -ForegroundColor red "Some of the release tags cannot be recognized as a semantic version string (https://semver.org)"
-            Write-Host -ForegroundColor red "Using default GitHub sorting for releases"
+            Write-Host "::Warning::Some of the release tags cannot be recognized as a semantic version string (https://semver.org). Using default GitHub sorting for releases, which will not work for release branches"
             $releases
         }
     }
@@ -407,12 +504,45 @@ function GetReleases {
     }
 }
 
+function GetLatestRelease {
+    Param(
+        [string] $token,
+        [string] $api_url = $ENV:GITHUB_API_URL,
+        [string] $repository = $ENV:GITHUB_REPOSITORY,
+        [string] $ref = $ENV:GITHUB_REFNAME
+    )
+    
+    Write-Host "Getting the latest release from $api_url/repos/$repository/releases/latest - branch $ref"
+    # Get all releases from GitHub, sorted by SemVer tag
+    # If any release tag is not a valid SemVer tag, use default GitHub sorting and issue a warning
+    # Default github sorting will return the latest historically created release as the latest release - not the highest version
+    $releases = GetReleases -token $token -api_url $api_url -repository $repository
+
+    # Get Latest release
+    $latestRelease = $releases | Where-Object { -not ($_.prerelease -or $_.draft) } | Select-Object -First 1
+    $releaseBranchPrefix = 'release/'
+    if ($ref -like "$releaseBranchPrefix*") {
+        # If release branch, get the latest release from that the release branch
+        # This is given by the latest release with the same major.minor as the release branch
+        $semVerObj = SemVerStrToSemVerObj -semVerStr $ref.SubString($releaseBranchPrefix.Length) -allowMajorMinorOnly
+        $latestRelease = $releases | Where-Object {
+            $releaseSemVerObj = SemVerStrToSemVerObj -semVerStr $_.tag_name
+            $semVerObj.Major -eq $releaseSemVerObj.Major -and $semVerObj.Minor -eq $releaseSemVerObj.Minor
+        } | Select-Object -First 1
+    }
+    $latestRelease
+}
+
 function GetHeader {
     param (
         [string] $token,
-        [string] $accept = "application/vnd.github.v3+json"
+        [string] $accept = "application/vnd.github+json",
+        [string] $apiVersion = "2022-11-28"
     )
-    $headers = @{ "Accept" = $accept }
+    $headers = @{
+        "Accept" = $accept
+        "X-GitHub-Api-Version" = $apiVersion
+    }
     if (![string]::IsNullOrEmpty($token)) {
         $headers["Authorization"] = "token $token"
     }
@@ -426,7 +556,8 @@ function GetReleaseNotes {
         [string] $repository = $ENV:GITHUB_REPOSITORY,
         [string] $api_url = $ENV:GITHUB_API_URL,
         [string] $tag_name,
-        [string] $previous_tag_name
+        [string] $previous_tag_name,
+        [string] $target_commitish
     )
     
     Write-Host "Generating release note $api_url/repos/$repository/releases/generate-notes"
@@ -435,27 +566,14 @@ function GetReleaseNotes {
         tag_name = $tag_name;
     }
 
-    if (-not [string]::IsNullOrEmpty($previous_tag_name)) {
+    if ($previous_tag_name) {
         $postParams["previous_tag_name"] = $previous_tag_name
+    }
+    if ($target_commitish) {
+        $postParams["target_commitish"] = $target_commitish
     }
 
     InvokeWebRequest -Headers (GetHeader -token $token) -Method POST -Body ($postParams | ConvertTo-Json) -Uri "$api_url/repos/$repository/releases/generate-notes" 
-}
-
-function GetLatestRelease {
-    Param(
-        [string] $token,
-        [string] $api_url = $ENV:GITHUB_API_URL,
-        [string] $repository = $ENV:GITHUB_REPOSITORY
-    )
-    
-    Write-Host "Getting the latest release from $api_url/repos/$repository/releases/latest"
-    try {
-        InvokeWebRequest -Headers (GetHeader -token $token) -Uri "$api_url/repos/$repository/releases/latest" -ignoreErrors | ConvertFrom-Json
-    }
-    catch {
-        return $null
-    }
 }
 
 function DownloadRelease {
@@ -472,13 +590,9 @@ function DownloadRelease {
     if ($projects -eq "") { $projects = "*" }
     Write-Host "Downloading release $($release.Name), projects $projects, type $mask"
     if ([string]::IsNullOrEmpty($token)) {
-        $authstatus = (invoke-gh -silent -returnValue auth status --show-token) -join " "
-        $token = $authStatus.SubString($authstatus.IndexOf('Token: ')+7).Trim()
+        $token = invoke-gh -silent -returnValue auth token
     }
-    $headers = @{ 
-        "Accept"        = "application/octet-stream"
-        "Authorization" = "token $token"
-    }
+    $headers = GetHeader -token $token -accept "application/octet-stream"
     $projects.Split(',') | ForEach-Object {
         $project = $_.Replace('\','_').Replace('/','_')
         Write-Host "project '$project'"
@@ -594,10 +708,10 @@ function GetArtifacts {
     do {
         $uri = "$api_url/repos/$repository/actions/artifacts?per_page=$($per_page)&page=$($page)"
         Write-Host $uri
-        $artifactsJson = InvokeWebRequest -UseBasicParsing -Headers $headers -Uri $uri
+        $artifactsJson = InvokeWebRequest -Headers $headers -Uri $uri
         $artifacts = $artifactsJson | ConvertFrom-Json
         $page++
-        $allArtifacts += @($artifacts.artifacts | Where-Object { $_.name -like "*-$branch-$mask-$version" })
+        $allArtifacts += @($artifacts.artifacts | Where-Object { !$_.expired -and $_.name -like "*-$branch-$mask-$version" })
         $result = @()
         $allArtifactsFound = $true
         $projects.Split(',') | ForEach-Object {
@@ -626,14 +740,10 @@ function DownloadArtifact {
     Write-Host "Downloading artifact $($artifact.Name)"
     Write-Host $artifact.archive_download_url
     if ([string]::IsNullOrEmpty($token)) {
-        $authstatus = (invoke-gh -silent -returnValue auth status --show-token) -join " "
-        $token = $authStatus.SubString($authstatus.IndexOf('Token: ')+7).Trim()
+        $token = invoke-gh -silent -returnValue auth token
     }
-    $headers = @{ 
-        "Authorization" = "token $token"
-        "Accept"        = "application/vnd.github.v3+json"
-    }
+    $headers = GetHeader -token $token
     $outFile = Join-Path $path "$($artifact.Name).zip"
     InvokeWebRequest -Headers $headers -Uri $artifact.archive_download_url -OutFile $outFile
     $outFile
-}    
+}

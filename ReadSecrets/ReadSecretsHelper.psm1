@@ -1,4 +1,8 @@
-$script:gitHubSecrets = $env:secrets | ConvertFrom-Json
+Param(
+    [string] $_gitHubSecrets
+)
+
+$script:gitHubSecrets = $_gitHubSecrets | ConvertFrom-Json
 $script:keyvaultConnectionExists = $false
 $script:azureRm210 = $false
 $script:isKeyvaultSet = $script:gitHubSecrets.PSObject.Properties.Name -eq "AZURE_CREDENTIALS"
@@ -44,12 +48,11 @@ function GetGithubSecret {
     if ($secretSplit.Count -gt 1) {
         $secret = $secretSplit[1]
     }
-    
+
     if ($script:gitHubSecrets.PSObject.Properties.Name -eq $secret) {
         $value = $script:githubSecrets."$secret"
         if ($value) {
             MaskValue -key $secret -value $value
-            Add-Content -Path $env:GITHUB_ENV -Value "$envVar=$value"
             return $value
         }
     }
@@ -58,21 +61,19 @@ function GetGithubSecret {
 }
 	
 function Get-KeyVaultCredentials {
-    Param(
-        [switch] $dontmask
-    )
     if ($script:isKeyvaultSet) {
+        $jsonStr = $script:gitHuBSecrets.AZURE_CREDENTIALS
+        if ($jsonStr -contains "`n" -or $jsonStr -contains "`r") {
+            throw "Secret AZURE_CREDENTIALS cannot contain line breaks"
+        }
         try {
-            $json = $script:gitHuBSecrets.AZURE_CREDENTIALS
-            if ($json.contains("`n")) { 
-                throw "Secret contains line breaks"
-            }
-            $creds = $json | ConvertFrom-Json
-            if (!$dontmask) {
-                "clientId", "clientSecret", "subscriptionId", "tenantId" | ForEach-Object {
-                    MaskValue -key $_ -value $creds."$_"
-                }
-            }
+            $creds = $jsonStr | ConvertFrom-Json
+            # Mask ClientSecret
+            MaskValue -key 'clientSecret' -value $creds.ClientSecret
+            # Check thet $creds contains the needed properties
+            $creds.ClientId | Out-Null
+            $creds.subscriptionId | Out-Null
+            $creds.TenantId | Out-Null
             return $creds
         }
         catch {
